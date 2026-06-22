@@ -22,6 +22,22 @@ from speculators.models.dflash.utils import (
 from speculators.models.metrics import kl_div_loss, resolve_loss_fn
 from speculators.models.utils import resolve_target_layer_ids
 
+if os.environ.get("DFLASH_FUSED_RMSNORM") == "1":
+    # Replace every Qwen3RMSNorm (model norms + per-layer norms + attention
+    # q/k norms, ~23 instances) with the fused NPU RMSNorm kernel: one kernel
+    # vs the eager cast->pow->mean->rsqrt->mul->cast chain (~3.9x/op, fewer
+    # launches + kills the fp32 up/down Casts). bf16-approximate, not bit-exact
+    # -> convergence validated by A/B (OPEN_ISSUES #2 / EXPERIMENTS).
+    import torch_npu  # noqa: PLC0415
+
+    def _npu_fused_rmsnorm_forward(self, hidden_states):
+        return torch_npu.npu_rms_norm(
+            hidden_states, self.weight, epsilon=self.variance_epsilon
+        )[0]
+
+    Qwen3RMSNorm.forward = _npu_fused_rmsnorm_forward
+    print("[dflash] fused NPU RMSNorm ON (DFLASH_FUSED_RMSNORM=1)", flush=True)
+
 
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
