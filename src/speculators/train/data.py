@@ -492,6 +492,7 @@ def create_collate_fn(
     num_target_layers: int = 3,
     dtype: torch.dtype = torch.bfloat16,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    postprocess: Callable[[BatchType], BatchType] | None = None,
 ):
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
         # Apply per-sample preprocessing and filter failed samples
@@ -534,6 +535,13 @@ def create_collate_fn(
             new_lengths.append(length)
             cum_length += length
         collated_data["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+
+        # Optional post-collation hook: derive extra batch fields from the packed
+        # sequence (e.g. DFlash precomputes anchors + mask-kernel metadata here so
+        # the model forward doesn't, off the training critical path). Runs in the
+        # dataloader worker; default None keeps the batch unchanged.
+        if postprocess is not None:
+            collated_data = postprocess(collated_data)
         return collated_data
 
     return collate_fn

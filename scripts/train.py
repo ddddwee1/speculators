@@ -1,6 +1,7 @@
 import argparse
 import gc
 import logging
+import os
 import random
 import warnings
 from copy import deepcopy
@@ -67,6 +68,36 @@ def set_seed(seed: int, deterministic: bool = False):
         torch.backends.cudnn.benchmark = False
 
 
+def make_dflash_collate_postprocess(max_anchors: int, block_size: int):
+    """Post-collation hook that precomputes DFlash anchors + mask-kernel metadata
+    on the packed batch, so the model forward consumes them instead of running
+    select_anchors / build_metadata on the training critical path (OPEN_ISSUES #2).
+
+    Runs in the dataloader worker (CPU). Imports are local so non-DFlash / non-kernel
+    runs never touch dflash_mask.
+    """
+    from dflash_mask import build_metadata
+    from speculators.models.dflash.utils import select_anchors
+
+    def _postprocess(collated):
+        loss_mask = collated["loss_mask"]  # [1, total_seq_len]
+        total_seq_len = loss_mask.shape[1]
+        anchor_positions, anchor_valid = select_anchors(loss_mask, max_anchors, block_size)
+        kv_doc, kv_iota, q_doc, q_anchor, blk_idx = build_metadata(
+            collated["lengths"], total_seq_len, anchor_positions, block_size
+        )
+        collated["anchor_positions"] = anchor_positions
+        collated["anchor_valid"] = anchor_valid
+        collated["mask_kv_doc"] = kv_doc
+        collated["mask_kv_iota"] = kv_iota
+        collated["mask_q_doc"] = q_doc
+        collated["mask_q_anchor"] = q_anchor
+        collated["mask_blk_idx"] = blk_idx
+        return collated
+
+    return _postprocess
+
+
 def setup_dataloader(
     dataset: BaseDataset,
     world_size: int,
@@ -76,6 +107,7 @@ def setup_dataloader(
     num_target_layers: int = 3,
     prefetch_factor: int = 4,
     preprocess=None,
+    collate_postprocess=None,
 ) -> DataLoader:
     """Setup dataloader for training.
     Args:
@@ -109,6 +141,7 @@ def setup_dataloader(
             num_target_layers=num_target_layers,
             dtype=dataset.hidden_states_dtype,
             preprocess=preprocess,
+            postprocess=collate_postprocess,
         ),
         persistent_workers=True,
     )
@@ -418,6 +451,19 @@ def main(args: argparse.Namespace):
             max_retries=args.max_retries,
         )
 
+    # DFlash: optionally precompute anchors + mask-kernel metadata in the dataloader
+    # (off the training critical path) when the NPU mask kernel is enabled. Falls
+    # back to in-forward select_anchors / mask build when unset (OPEN_ISSUES #2).
+    collate_postprocess = None
+    if (
+        args.speculator_type == "dflash"
+        and os.environ.get("DFLASH_USE_MASK_KERNEL", "0") == "1"
+        and os.environ.get("DFLASH_MASK_PRECOMPUTE", "0") == "1"
+    ):
+        collate_postprocess = make_dflash_collate_postprocess(
+            args.max_anchors, args.block_size
+        )
+
     train_loader = setup_dataloader(
         train_dataset,
         world_size,
@@ -427,6 +473,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        collate_postprocess=collate_postprocess,
     )
     val_loader = setup_dataloader(
         val_dataset,
@@ -437,6 +484,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        collate_postprocess=collate_postprocess,
     )
 
     # Get trainer kwargs from model class

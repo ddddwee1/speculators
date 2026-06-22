@@ -262,22 +262,48 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, lengths, device):
+    def _build_attention_mask(
+        self,
+        loss_mask,
+        lengths,
+        device,
+        *,
+        anchor_positions=None,
+        anchor_valid=None,
+        mask_metadata=None,
+    ):
         total_seq_len = loss_mask.shape[1]
 
-        anchor_positions, anchor_valid = select_anchors(
-            loss_mask, self.config.max_anchors, self.block_size
-        )
+        # anchors may be precomputed in the dataloader (OPEN_ISSUES #2); else select here.
+        if anchor_positions is None:
+            anchor_positions, anchor_valid = select_anchors(
+                loss_mask, self.config.max_anchors, self.block_size
+            )
 
         full_attn_mask = None
         if self.uses_full_attn:
-            full_attn_mask = self._create_attention_mask(
-                lengths=lengths,
-                total_seq_len=total_seq_len,
-                anchor_positions=anchor_positions,
-                device=device,
-                sliding_window=None,
-            )
+            if mask_metadata is not None and self._use_mask_kernel:
+                # precomputed kernel metadata -> call the kernel directly, keeping
+                # select_anchors / build_metadata off the training critical path.
+                from dflash_mask import mask_from_metadata  # noqa: PLC0415
+
+                if not getattr(self, "_mask_kernel_meta_logged", False):
+                    print(
+                        "[dflash] mask via NPU kernel (dataloader-precomputed metadata)",
+                        flush=True,
+                    )
+                    self._mask_kernel_meta_logged = True
+                full_attn_mask = mask_from_metadata(
+                    *mask_metadata, self.block_size, device
+                )
+            else:
+                full_attn_mask = self._create_attention_mask(
+                    lengths=lengths,
+                    total_seq_len=total_seq_len,
+                    anchor_positions=anchor_positions,
+                    device=device,
+                    sliding_window=None,
+                )
 
         sliding_window_attn_mask = None
         if self.uses_sliding_window_attn:
@@ -315,8 +341,30 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
+        # Optional dataloader-precomputed anchors + mask-kernel metadata (popped
+        # from kwargs so they don't flow into the decoder layers). OPEN_ISSUES #2.
+        pre_anchor_positions = kwargs.pop("anchor_positions", None)
+        pre_anchor_valid = kwargs.pop("anchor_valid", None)
+        _kv_doc = kwargs.pop("mask_kv_doc", None)
+        _kv_iota = kwargs.pop("mask_kv_iota", None)
+        _q_doc = kwargs.pop("mask_q_doc", None)
+        _q_anchor = kwargs.pop("mask_q_anchor", None)
+        _blk_idx = kwargs.pop("mask_blk_idx", None)
+        pre_mask_metadata = (
+            (_kv_doc, _kv_iota, _q_doc, _q_anchor, _blk_idx)
+            if _kv_doc is not None
+            else None
+        )
+
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, lengths, device)
+            self._build_attention_mask(
+                loss_mask,
+                lengths,
+                device,
+                anchor_positions=pre_anchor_positions,
+                anchor_valid=pre_anchor_valid,
+                mask_metadata=pre_mask_metadata,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size
