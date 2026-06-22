@@ -221,7 +221,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # NPU mask-kernel fast-path: bit-exact drop-in for create_mask on the
         # full-attention path (sliding_window=None). Falls back to create_mask for
         # the sliding-window and flex (create_block_mask) paths, which the kernel
-        # does not cover. build_metadata is host-side, so pass CPU index tensors.
+        # does not cover. dflash_mask builds metadata on the input device, so pass
+        # the on-device tensors directly (no D2H sync on the training critical path).
         # See OPEN_ISSUES #2 / TRAINING_INTEGRATION.md.
         if (
             self._use_mask_kernel
@@ -237,9 +238,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 )
                 self._mask_kernel_logged = True
             return _kernel_mask(
-                lengths.cpu(),
+                lengths,
                 total_seq_len,
-                anchor_positions.cpu(),
+                anchor_positions,
                 self.block_size,
                 device,
             )
