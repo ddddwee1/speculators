@@ -1,3 +1,4 @@
+import os
 from typing import ClassVar
 
 import torch
@@ -99,6 +100,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size
+        # Optional NPU mask-kernel fast-path for the dense full-attention mask
+        # (OPEN_ISSUES #2). Off by default and gated by env, so baseline vs
+        # kernel runs are a single flag flip. Only replaces create_mask on the
+        # full-attention (sliding_window=None) sdpa/eager path.
+        self._use_mask_kernel = os.environ.get("DFLASH_USE_MASK_KERNEL", "0") == "1"
         self.post_init()
 
     @property
@@ -212,6 +218,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
     ):
+        # NPU mask-kernel fast-path: bit-exact drop-in for create_mask on the
+        # full-attention path (sliding_window=None). Falls back to create_mask for
+        # the sliding-window and flex (create_block_mask) paths, which the kernel
+        # does not cover. build_metadata is host-side, so pass CPU index tensors.
+        # See OPEN_ISSUES #2 / TRAINING_INTEGRATION.md.
+        if (
+            self._use_mask_kernel
+            and sliding_window is None
+            and self._create_mask_fn is create_mask
+        ):
+            from dflash_mask import mask as _kernel_mask  # noqa: PLC0415
+
+            if not getattr(self, "_mask_kernel_logged", False):
+                print(
+                    "[dflash] mask via NPU kernel (DFLASH_USE_MASK_KERNEL=1)",
+                    flush=True,
+                )
+                self._mask_kernel_logged = True
+            return _kernel_mask(
+                lengths.cpu(),
+                total_seq_len,
+                anchor_positions.cpu(),
+                self.block_size,
+                device,
+            )
         mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
             lengths=lengths.to(device),
             total_seq_len=total_seq_len,
