@@ -1,4 +1,5 @@
 import logging
+import os
 import warnings
 from typing import Literal, NamedTuple
 
@@ -61,6 +62,10 @@ class Trainer:
     ):
         self.model = model
         self.config = config
+        # DFLASH_SAVE_BEST_AT_END: when val improves every epoch (common in early
+        # training), save_best rewrites the full model (~13s) every epoch. With this
+        # on, track the best loss in-loop and write a single checkpoint at the end.
+        self._save_best_at_end = os.environ.get("DFLASH_SAVE_BEST_AT_END", "0") == "1"
         self.local_rank = config.local_rank
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -314,6 +319,11 @@ class Trainer:
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:
             return
+        if self._save_best_at_end:
+            # Track the best loss only; defer the single disk write to run_training.
+            if val_metrics["loss_epoch"] < self.best_val_loss:
+                self.best_val_loss = val_metrics["loss_epoch"]
+            return
         if val_metrics["loss_epoch"] >= self.best_val_loss:
             return
 
@@ -367,3 +377,13 @@ class Trainer:
 
             if self.is_distributed:
                 dist.barrier()
+
+        if self._save_best_at_end:
+            root_logger.info(
+                "Saving best checkpoint at end (DFLASH_SAVE_BEST_AT_END=1, "
+                f"best_val_loss={self.best_val_loss:.6f})"
+            )
+            self.checkpointer.save_checkpoint(self.model, self.opt, n_epochs - 1)
+            if self.scheduler is not None:
+                self.checkpointer.save_scheduler_state_dict(self.scheduler, n_epochs - 1)
+            self.checkpointer.update_best_symlink(n_epochs - 1)
